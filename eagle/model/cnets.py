@@ -551,6 +551,28 @@ class Model(nn.Module):
     def reset(self):
         self.tree_mask = None
 
+    def _invalid_draft_mask(self, device):
+        if self.config.vocab_size == self.config.draft_vocab_size:
+            return None
+
+        invalid = (self.d2t < 0) | (self.d2t >= self.config.vocab_size)
+        invalid_count = int(invalid.sum().item())
+        if invalid_count == 0:
+            return None
+
+        valid_count = int((~invalid).sum().item())
+        if valid_count < self.top_k:
+            raise ValueError(
+                f"EAGLE draft vocab only has {valid_count} valid draft->target mappings "
+                f"for top_k={self.top_k}"
+            )
+
+        if not getattr(self, "_warned_invalid_d2t", False):
+            print(f"[EAGLE] Masking {invalid_count} invalid draft->target token mappings")
+            self._warned_invalid_d2t = True
+
+        return invalid.to(device=device)
+
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -685,6 +707,7 @@ class Model(nn.Module):
 
         len_posi = input_ids.shape[1]
         self.reset()
+        invalid_draft_mask = self._invalid_draft_mask(hidden_states.device)
 
         # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
@@ -700,6 +723,8 @@ class Model(nn.Module):
         last_headout = self.lm_head(self.norm(last_hidden))
 
         last_p = self.logsoftmax(last_headout)
+        if invalid_draft_mask is not None:
+            last_p = last_p.masked_fill(invalid_draft_mask, torch.finfo(last_p.dtype).min)
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
@@ -709,8 +734,10 @@ class Model(nn.Module):
             ss_token.append(topk_index)
             input_ids = topk_index
         else:
-            ss_token.append(topk_index+self.d2t[topk_index])
-            input_ids = topk_index+self.d2t[topk_index]
+            # d2t[i] stores the direct full-vocab ID for draft token i (not an offset).
+            # Do NOT add topk_index — that would produce out-of-range indices.
+            ss_token.append(self.d2t[topk_index])
+            input_ids = self.d2t[topk_index]
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
@@ -733,6 +760,8 @@ class Model(nn.Module):
 
             last_headout = self.lm_head(self.norm(out_hidden[0]))
             last_p = self.logsoftmax(last_headout)
+            if invalid_draft_mask is not None:
+                last_p = last_p.masked_fill(invalid_draft_mask, torch.finfo(last_p.dtype).min)
 
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
@@ -751,8 +780,9 @@ class Model(nn.Module):
             if self.config.vocab_size == self.config.draft_vocab_size:
                 ss_token.append(topk_index)
             else:
-                input_ids = input_ids + self.d2t[input_ids]
-                ss_token.append(topk_index+self.d2t[topk_index])
+                # d2t[i] is a direct full-vocab ID (not an offset); index directly.
+                input_ids = self.d2t[input_ids]
+                ss_token.append(self.d2t[topk_index])
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
 

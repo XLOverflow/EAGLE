@@ -557,13 +557,22 @@ class Model(nn.Module):
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
 
-        # [MODIFIED] add tree mask
+        # [MODIFIED] add tree mask — use arithmetic to avoid CUDA boolean-indexing assert
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
             tree_mask = self.tree_mask
             _, _, tree_shape0, tree_shape1 = tree_mask.shape
-            combined_attention_mask[:, :, -tree_shape0:, -tree_shape1:][
-                tree_mask == 0
-                ] = torch.finfo(torch.float32).min
+            neg_inf = torch.finfo(torch.float32).min / 2
+            # addon: 0 where tree_mask==1 (attend), neg_inf where tree_mask==0 (block)
+            addon = neg_inf * (1.0 - tree_mask.float())  # [1, 1, tree_shape0, tree_shape1]
+            # pad addon to match combined_attention_mask on left/top
+            pad_left = combined_attention_mask.shape[-1] - tree_shape1
+            pad_top  = combined_attention_mask.shape[-2] - tree_shape0
+            addon_padded = torch.nn.functional.pad(
+                addon.to(combined_attention_mask.device),
+                (pad_left, 0, pad_top, 0),
+                value=0.0,
+            )
+            combined_attention_mask = combined_attention_mask + addon_padded
 
         return combined_attention_mask
 

@@ -41,7 +41,13 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+try:
+    from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+except ImportError:
+    from transformers.utils import auto_docstring, can_return_tuple, logging
+    from typing import TypedDict
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
@@ -468,12 +474,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 else expanded_attn_mask + combined_attention_mask
             )
 
-        if hasattr(self, "tree_mask") and self.tree_mask is not None:
-            tree_mask = self.tree_mask
-            tree_len = tree_mask.size(-1)
-            combined_attention_mask[:, :, -tree_len:, -tree_len:][
-                tree_mask == 0
-                ] = combined_attention_mask.min()
+        # [MODIFIED] tree_mask is now injected after create_causal_mask in forward()
+        # to avoid CUDA boolean-indexing assert with transformers>=4.57
 
         return combined_attention_mask
 
@@ -520,22 +522,29 @@ class Qwen3Model(Qwen3PreTrainedModel):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
+        if inputs_embeds is None:
+            invalid_input_ids = (input_ids < 0) | (input_ids >= self.vocab_size)
+            if torch.any(invalid_input_ids):
+                bad_ids = input_ids[invalid_input_ids][:8].detach().cpu().tolist()
+                raise ValueError(
+                    f"Qwen3Model received invalid token ids {bad_ids} outside "
+                    f"[0, {self.vocab_size - 1}]"
+                )
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if cache_position is None:
+            cache_position = torch.arange(
                 past_key_values_length,
                 seq_length + past_key_values_length,
                 dtype=torch.long,
-                device=device,
+                device=inputs_embeds.device,
             )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-            
-            
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-                # embed positions
+
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past),
@@ -567,6 +576,30 @@ class Qwen3Model(Qwen3PreTrainedModel):
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+        # [MODIFIED] Inject EAGLE tree_mask into causal_mask_mapping using arithmetic
+        # (avoids CUDA boolean-indexing assert that occurs with boolean fancy-indexing
+        # on strided slices in newer CUDA/PyTorch).
+        # tree_mask: [1, 1, tree_len, tree_len], 1=attend, 0=block
+        # Conversion: blocked positions become -inf via  neg_inf * (1 - tree_mask)
+        if hasattr(self, "tree_mask") and self.tree_mask is not None:
+            _tree_mask = self.tree_mask  # [1, 1, tree_len, tree_len]
+            _tree_len = _tree_mask.size(-1)
+            for _key in list(causal_mask_mapping.keys()):
+                _mask = causal_mask_mapping[_key]
+                if _mask is None:
+                    continue
+                if _mask.shape[-1] < _tree_len or _mask.shape[-2] < _tree_len:
+                    continue
+                _neg_inf = torch.finfo(_mask.dtype).min / 2
+                # arithmetic inject: 0 where attend, neg_inf where blocked
+                _addon = _neg_inf * (1.0 - _tree_mask.float())  # [1,1,tree_len,tree_len]
+                _addon = _addon.to(dtype=_mask.dtype, device=_mask.device)
+                _mask = _mask.clone()
+                _mask[:, :, -_tree_len:, -_tree_len:] = (
+                    _mask[:, :, -_tree_len:, -_tree_len:] + _addon
+                )
+                causal_mask_mapping[_key] = _mask
 
         hidden_states = inputs_embeds
 
